@@ -178,21 +178,33 @@ class SlackAdapter(PushNotificationAdapter):
             
             # Format changes for Slack
             change_fields = []
-            for i, change in enumerate(changes[:3]):  # Limit to 3 for brevity
-                if change.get("type") == "initial_sync":
-                    value = f"Initial sync: {change['records_count']} records"
+            for i, change in enumerate(changes[:5]):  # Limit to 5 changes for brevity
+                action = change.get("action", "UNKNOWN").replace("_", " ").title()
+                field = change.get("field", "N/A").replace("_", " ").title()
+                old_value = str(change.get("old_value")) if change.get("old_value") is not None else "N/A"
+                new_value = str(change.get("new_value")) if change.get("new_value") is not None else "N/A"
+
+                if action == "Initial Sync Available":
+                    value = "Domain found to be available on initial check."
+                elif action == "Initial Sync Registered":
+                    value = "Domain found to be registered on initial check."
+                elif action == "Became Available":
+                    value = f"Domain changed from registered to AVAILABLE!"
+                elif action == "Became Registered":
+                    value = f"Domain changed from available to REGISTERED."
                 else:
-                    value = f"{change.get('action').upper()}: {change.get('name')} ({change.get('type')})"
+                    value = f"{field}: {old_value} -> {new_value}"
+
                 change_fields.append({
-                    "title": f"Change {i+1}",
+                    "title": f"Change {i+1} ({action})",
                     "value": value,
-                    "short": True
+                    "short": False # Set to False for better readability of multi-line values
                 })
-            
-            if len(changes) > 3:
+
+            if len(changes) > 5:
                 change_fields.append({
-                    "title": "More",
-                    "value": f"... and {len(changes) - 3} more changes",
+                    "title": "More Changes",
+                    "value": f"... and {len(changes) - 5} more changes",
                     "short": True
                 })
             
@@ -257,20 +269,28 @@ class DiscordAdapter(PushNotificationAdapter):
             
             # Format changes
             change_lines = []
-            for change in changes[:5]:
-                if change.get("type") == "initial_sync":
-                    change_lines.append(f"📋 Initial sync: {change['records_count']} records")
+            for change in changes[:5]: # Limit to 5 changes for brevity
+                action = change.get("action", "UNKNOWN").replace("_", " ").title()
+                field = change.get("field", "N/A").replace("_", " ").title()
+                old_value = str(change.get("old_value")) if change.get("old_value") is not None else "N/A"
+                new_value = str(change.get("new_value")) if change.get("new_value") is not None else "N/A"
+
+                if action == "Initial Sync Available":
+                    change_lines.append(f"📋 Domain found to be available on initial check.")
+                elif action == "Initial Sync Registered":
+                    change_lines.append(f"📋 Domain found to be registered on initial check.")
+                elif action == "Became Available":
+                    change_lines.append(f"🎉 Domain changed from registered to AVAILABLE!")
+                elif action == "Became Registered":
+                    change_lines.append(f"✅ Domain changed from available to REGISTERED.")
                 else:
                     action_emoji = {
-                        "added": "➕",
-                        "removed": "➖",
-                        "modified": "✏️"
-                    }.get(change.get("action"), "❓")
-                    change_lines.append(
-                        f"{action_emoji} {change.get('action').upper()}: "
-                        f"{change.get('name')} ({change.get('type')})"
-                    )
-            
+                        "Added": "➕",
+                        "Removed": "➖",
+                        "Modified": "✏️"
+                    }.get(action, "❓")
+                    change_lines.append(f"{action_emoji} {field}: `{old_value}` -> `{new_value}`")
+
             if len(changes) > 5:
                 change_lines.append(f"... and {len(changes) - 5} more changes")
             

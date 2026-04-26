@@ -36,11 +36,13 @@ class WhoisClient:
         """Fetch WHOIS information for a domain"""
         try:
             # Use whois.query for structured data
-            whois_data = whois.query(domain)
+            whois_data = whois.whois(domain)
 
-            if not whois_data:
-                logger.warning(f"No WHOIS data found for {domain}")
-                return None
+            if not whois_data or not whois_data.domain_name:
+                # This typically means the domain is available or WHOIS data is incomplete/unavailable
+                # We return a specific structure to indicate availability
+                logger.info(f"Domain {domain} appears to be available (no WHOIS data found).")
+                return {"domain_name": domain, "is_available": True}
 
             # Extract relevant fields and standardize
             info = {
@@ -53,7 +55,8 @@ class WhoisClient:
                 "status": whois_data.status,
                 "registrant_name": whois_data.registrant_name,
                 "registrant_organization": whois_data.registrant_organization,
-                "dnssec": whois_data.dnssec # Add DNSSEC status
+                "dnssec": whois_data.dnssec, # Add DNSSEC status
+                "is_available": False # Explicitly mark as not available if WHOIS data is present
             }
 
             # Handle cases where some fields might be lists (e.g., status, name_servers)
@@ -117,6 +120,7 @@ class DNSStateManager:
         """Generate hash of critical WHOIS info for comparison"""
         # Select critical fields for hashing to avoid alerts on trivial changes
         critical_fields = {
+            "is_available": whois_info.get("is_available", False), # Include availability status
             "expiration_date": whois_info.get("expiration_date"),
             "status": whois_info.get("status"),
             "registrant_name": whois_info.get("registrant_name"),
@@ -133,6 +137,7 @@ class ChangeDetector:
     
     # Critical WHOIS fields whose changes are highly important
     CRITICAL_WHOIS_FIELDS = {
+        "is_available": 25,    # Highest importance if availability status changes
         "expiration_date": 20, # Very critical if changes
         "status": 20,          # Very critical
         "name_servers": 15,    # High importance
@@ -151,20 +156,54 @@ class ChangeDetector:
         Returns: (list of changes, importance_score)
         """
         if old_info is None:
-            # First run - all records are "new" (initial sync)
-            changes = [
-                {
-                    "action": "initial_sync",
-                    "domain_name": new_info.get("domain_name"),
-                    "timestamp": datetime.now().isoformat()
-                }
-            ]
-            return changes, 0  # Don't alert on first run
+            if new_info.get("is_available", False):
+                logger.info(f"Initial sync: Domain {new_info.get("domain_name")} is available.")
+                changes = [
+                    {
+                        "action": "initial_sync_available",
+                        "domain_name": new_info.get("domain_name"),
+                        "current_status": "available",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                ]
+                return changes, 0 # No alert on initial sync, just log
+            else:
+                # First run - all records are "new" (initial sync) for a registered domain
+                changes = [
+                    {
+                        "action": "initial_sync_registered",
+                        "domain_name": new_info.get("domain_name"),
+                        "current_status": "registered",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                ]
+                return changes, 0  # Don't alert on first run
 
         changes = []
         importance_score = 0
-        
-        for field, score_value in self.CRITICAL_WHOIS_FIELDS.items():
+
+        # Check for availability status change first due to its critical nature
+        old_is_available = old_info.get("is_available", False)
+        new_is_available = new_info.get("is_available", False)
+
+        if old_is_available != new_is_available:
+            action_type = "became_available" if new_is_available else "became_registered"
+            changes.append({
+                "action": action_type,
+                "field": "is_available",
+                "old_value": old_is_available,
+                "new_value": new_is_available,
+                "timestamp": datetime.now().isoformat()
+            })
+            importance_score += self.CRITICAL_WHOIS_FIELDS["is_available"]
+
+            # If it became available, other fields might be empty, so no need to compare them
+            if new_is_available:
+                return changes, importance_score
+            # If it became registered, continue to compare other fields with new_info
+
+        # Compare other critical WHOIS fields if the domain is registered in the new state
+        if not new_is_available:
             old_val = old_info.get(field)
             new_val = new_info.get(field)
 
@@ -281,25 +320,44 @@ class DNSWatchdogAgent:
         
         # Trigger notifications based on importance
         if changes:
+            domain_name = current_whois_info.get("domain_name", domain)
+            is_currently_available = current_whois_info.get("is_available", False)
+
             if previous_whois_info is None:
-                logger.info(f"Initial sync for {domain} - no notification sent")
-                # For karlik.cz, if it's currently available, this is where we'd notify
-                # However, initial sync is not an alert
-            elif importance_score >= 20:
-                title = f"🚨 CRITICAL: WHOIS changes detected on {domain}"
-                message = f"{len(changes)} critical WHOIS field(s) changed - requires immediate attention"
-                logger.warning(f"Critical changes detected for {domain} (score: {importance_score})")
-                self.notification_sender.send(title, message, changes, importance_score, domain)
-            elif importance_score >= 10:
-                title = f"⚠️ WARNING: WHOIS changes detected on {domain}"
-                message = f"{len(changes)} important WHOIS field(s) changed - review required"
-                logger.warning(f"Warning: WHOIS changes for {domain} (score: {importance_score})")
-                self.notification_sender.send(title, message, changes, importance_score, domain)
-            elif importance_score > 0:
-                title = f"ℹ️ INFO: WHOIS changes on {domain}"
-                message = f"{len(changes)} WHOIS field(s) changed"
-                logger.info(f"Info: Minor WHOIS changes for {domain} (score: {importance_score})")
-                self.notification_sender.send(title, message, changes, importance_score, domain)
+                # Initial sync
+                if is_currently_available:
+                    # For karlik.cz, if it's found available on initial sync, it's just an info log
+                    logger.info(f"Initial sync for {domain_name} - found as available. No notification sent.")
+                else:
+                    logger.info(f"Initial sync for {domain_name} - found as registered. No notification sent.")
+            else:
+                # Handle specific availability change notifications
+                old_is_available = previous_whois_info.get("is_available", False)
+                if not old_is_available and is_currently_available: # Became available
+                    title = f"🎉 DOMAIN AVAILABLE: {domain_name} is now FREE!"
+                    message = f"The domain {domain_name} has just become available for registration! Act fast!"
+                    logger.critical(f"Critical: {domain_name} became available.")
+                    self.notification_sender.send(title, message, changes, importance_score, domain)
+                elif old_is_available and not is_currently_available: # Became registered
+                    title = f"✅ DOMAIN REGISTERED: {domain_name} is no longer FREE."
+                    message = f"The domain {domain_name} has been registered. It is no longer available."
+                    logger.info(f"Info: {domain_name} became registered.")
+                    self.notification_sender.send(title, message, changes, importance_score, domain)
+                elif importance_score >= 20:
+                    title = f"🚨 CRITICAL: WHOIS changes detected on {domain_name}"
+                    message = f"{len(changes)} critical WHOIS field(s) changed - requires immediate attention"
+                    logger.warning(f"Critical changes detected for {domain_name} (score: {importance_score})")
+                    self.notification_sender.send(title, message, changes, importance_score, domain)
+                elif importance_score >= 10:
+                    title = f"⚠️ WARNING: WHOIS changes detected on {domain_name}"
+                    message = f"{len(changes)} important WHOIS field(s) changed - review required"
+                    logger.warning(f"Warning: WHOIS changes for {domain_name} (score: {importance_score})")
+                    self.notification_sender.send(title, message, changes, importance_score, domain)
+                elif importance_score > 0:
+                    title = f"ℹ️ INFO: WHOIS changes on {domain_name}"
+                    message = f"{len(changes)} WHOIS field(s) changed"
+                    logger.info(f"Info: Minor WHOIS changes for {domain_name} (score: {importance_score})")
+                    self.notification_sender.send(title, message, changes, importance_score, domain)
         else:
             logger.info(f"No changes detected for {domain}")
         
