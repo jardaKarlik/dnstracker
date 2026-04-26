@@ -234,20 +234,37 @@ class DNSWatchdogAgent:
         self.change_detector = ChangeDetector()
         
         # Initialize notification sender using the factory
-        adapter_kwargs = {"webhook_url": self.push_service_url}
-        if self.push_token:
-            adapter_kwargs["auth_token"] = self.push_token
-        
-        # Special handling for Firebase/Pushover/Pushbullet that use PUSH_TOKEN as API key/user key
-        if self.push_service_type.lower() == "firebase":
-            adapter_kwargs = {"server_key": self.push_token}
+        adapter_kwargs = {}
+        push_service_type_lower = self.push_service_type.lower()
+
+        if push_service_type_lower in ["discord", "slack", "webhook"]:
+            # These services primarily use a webhook URL
+            if not self.push_service_url:
+                raise ValueError(f"PUSH_SERVICE_URL environment variable not set for {self.push_service_type} notifications")
+            adapter_kwargs["webhook_url"] = self.push_service_url
+            # Only generic webhook uses PUSH_TOKEN as an auth_token
+            if push_service_type_lower == "webhook" and self.push_token:
+                adapter_kwargs["auth_token"] = self.push_token
+        elif push_service_type_lower == "firebase":
+            if not self.push_token:
+                raise ValueError("PUSH_TOKEN (server_key) environment variable not set for Firebase")
+            adapter_kwargs["server_key"] = self.push_token
             if os.getenv("FCM_DEVICE_TOKEN"): # Optional device token for Firebase
                 adapter_kwargs["device_token"] = os.getenv("FCM_DEVICE_TOKEN")
-        elif self.push_service_type.lower() == "pushover":
-            adapter_kwargs = {"api_token": self.push_token, "user_key": os.getenv("PUSHOVER_USER_KEY")}
-        elif self.push_service_type.lower() == "pushbullet":
-            adapter_kwargs = {"access_token": self.push_token}
-        
+        elif push_service_type_lower == "pushover":
+            if not self.push_token:
+                raise ValueError("PUSH_TOKEN (api_token) environment variable not set for Pushover")
+            if not os.getenv("PUSHOVER_USER_KEY"):
+                raise ValueError("PUSHOVER_USER_KEY environment variable not set for Pushover")
+            adapter_kwargs["api_token"] = self.push_token
+            adapter_kwargs["user_key"] = os.getenv("PUSHOVER_USER_KEY")
+        elif push_service_type_lower == "pushbullet":
+            if not self.push_token:
+                raise ValueError("PUSH_TOKEN (access_token) environment variable not set for Pushbullet")
+            adapter_kwargs["access_token"] = self.push_token
+        else:
+            raise ValueError(f"Unknown or unsupported PUSH_SERVICE_TYPE: {self.push_service_type}")
+
         self.notification_sender = create_adapter(self.push_service_type, **adapter_kwargs)
         
         logger.info(f"DNS Watchdog Agent initialized for domains: {', '.join(self.domains_to_monitor)}")
