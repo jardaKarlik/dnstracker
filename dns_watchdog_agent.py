@@ -204,19 +204,23 @@ class ChangeDetector:
 
         # Compare other critical WHOIS fields if the domain is registered in the new state
         if not new_is_available:
-            old_val = old_info.get(field)
-            new_val = new_info.get(field)
+            for field, score_value in self.CRITICAL_WHOIS_FIELDS.items():
+                if field == "is_available": # Skip if already handled
+                    continue
 
-            if old_val != new_val:
-                change = {
-                    "action": "modified",
-                    "field": field,
-                    "old_value": old_val,
-                    "new_value": new_val,
-                    "timestamp": datetime.now().isoformat()
-                }
-                changes.append(change)
-                importance_score += score_value
+                old_val = old_info.get(field)
+                new_val = new_info.get(field)
+
+                if old_val != new_val:
+                    change = {
+                        "action": "modified",
+                        "field": field,
+                        "old_value": old_val,
+                        "new_value": new_val,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    changes.append(change)
+                    importance_score += score_value
         
         return changes, importance_score
     
