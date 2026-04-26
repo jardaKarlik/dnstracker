@@ -9,7 +9,6 @@
     "restartPolicyMaxRetries": 3
   },
   "variables": [
-    "ZONER_API_TOKEN",
     "PUSH_SERVICE_TYPE",
     "PUSH_SERVICE_URL",
     "PUSH_TOKEN",

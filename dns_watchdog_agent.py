@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DNS Watchdog Agent - Monitors domain DNS records for changes
+DNS Watchdog Agent - Monitors domain WHOIS records for changes
 Runs on custom cron schedule, tracks state in JSON, sends push notifications
 """
 
@@ -9,10 +9,10 @@ import json
 import hashlib
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-import requests
+from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
-from push_adapters import create_adapter # <--- ADDED THIS LINE
+import whois # <--- ADDED THIS LINE
+from push_adapters import create_adapter
 
 # Configure logging
 logging.basicConfig(
@@ -26,38 +26,47 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class ZonerAPIClient:
-    """Client for ZONER REST API DNS operations"""
-    
-    BASE_URL = "https://api.czechia.com"
-    
-    def __init__(self, auth_token: str):
-        self.auth_token = auth_token
-        self.session = requests.Session()
-        self.session.headers.update({
-            "authorizationToken": auth_token
-        })
-    
-    def get_dns_records(self, domain: str) -> Optional[Dict]:
-        """Fetch DNS records for a domain"""
+# Removed ZonerAPIClient class entirely
+
+
+class WhoisClient:
+    """Client for WHOIS domain information lookups"""
+
+    def get_domain_info(self, domain: str) -> Optional[Dict]:
+        """Fetch WHOIS information for a domain"""
         try:
-            url = f"{self.BASE_URL}/api/DNS/{domain}"
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch DNS records for {domain}: {e}")
-            return None
-    
-    def get_allowed_ips(self) -> Optional[List[str]]:
-        """Fetch allowed IP addresses"""
-        try:
-            url = f"{self.BASE_URL}/api/Customer/AllowedIP"
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch allowed IPs: {e}")
+            # Use whois.query for structured data
+            whois_data = whois.query(domain)
+
+            if not whois_data:
+                logger.warning(f"No WHOIS data found for {domain}")
+                return None
+
+            # Extract relevant fields and standardize
+            info = {
+                "domain_name": whois_data.domain_name,
+                "registrar": whois_data.registrar,
+                "creation_date": whois_data.creation_date.isoformat() if whois_data.creation_date else None,
+                "expiration_date": whois_data.expiration_date.isoformat() if whois_data.expiration_date else None,
+                "last_updated": whois_data.last_updated.isoformat() if whois_data.last_updated else None,
+                "name_servers": sorted([ns.lower() for ns in whois_data.name_servers]) if whois_data.name_servers else [],
+                "status": whois_data.status,
+                "registrant_name": whois_data.registrant_name,
+                "registrant_organization": whois_data.registrant_organization,
+                "dnssec": whois_data.dnssec # Add DNSSEC status
+            }
+
+            # Handle cases where some fields might be lists (e.g., status, name_servers)
+            for key in ["creation_date", "expiration_date", "last_updated", "status"]:
+                if isinstance(info.get(key), list):
+                    info[key] = info[key][0] if info[key] else None
+            if isinstance(info.get("name_servers"), str):
+                info["name_servers"] = [info["name_servers"].lower()]
+
+
+            return info
+        except Exception as e:
+            logger.error(f"Failed to fetch WHOIS info for {domain}: {e}", exc_info=True)
             return None
 
 
@@ -92,119 +101,87 @@ class DNSStateManager:
         """Get stored state for a domain"""
         return self.state.get(domain)
     
-    def set_domain_state(self, domain: str, records: Dict, timestamp: str = None):
-        """Store state for a domain"""
+    def set_domain_state(self, domain: str, whois_info: Dict, timestamp: str = None):
+        """Store WHOIS info for a domain"""
         if timestamp is None:
             timestamp = datetime.now().isoformat()
         
         self.state[domain] = {
             "timestamp": timestamp,
-            "records_hash": self._hash_records(records),
-            "records": records
+            "whois_hash": self._hash_whois_info(whois_info), # Updated hash key
+            "whois_info": whois_info # Store WHOIS info
         }
     
     @staticmethod
-    def _hash_records(records: Dict) -> str:
-        """Generate hash of DNS records for comparison"""
-        record_str = json.dumps(records, sort_keys=True)
-        return hashlib.sha256(record_str.encode()).hexdigest()
+    def _hash_whois_info(whois_info: Dict) -> str: # Updated method name and signature
+        """Generate hash of critical WHOIS info for comparison"""
+        # Select critical fields for hashing to avoid alerts on trivial changes
+        critical_fields = {
+            "expiration_date": whois_info.get("expiration_date"),
+            "status": whois_info.get("status"),
+            "registrant_name": whois_info.get("registrant_name"),
+            "registrant_organization": whois_info.get("registrant_organization"),
+            "name_servers": whois_info.get("name_servers"),
+            "dnssec": whois_info.get("dnssec")
+        }
+        info_str = json.dumps(critical_fields, sort_keys=True)
+        return hashlib.sha256(info_str.encode()).hexdigest()
 
 
 class ChangeDetector:
-    """Detects and scores DNS changes"""
+    """Detects and scores WHOIS changes"""
     
-    # Priority levels for different record types
-    CRITICAL_TYPES = {"A", "AAAA", "MX"}  # Critical for service
-    HIGH_TYPES = {"CNAME", "NS"}  # Affects routing
-    MEDIUM_TYPES = {"TXT", "SPF", "DKIM"}  # Security/verification
-    LOW_TYPES = {"SRV", "CAA"}  # Less critical
+    # Critical WHOIS fields whose changes are highly important
+    CRITICAL_WHOIS_FIELDS = {
+        "expiration_date": 20, # Very critical if changes
+        "status": 20,          # Very critical
+        "name_servers": 15,    # High importance
+        "registrant_name": 10, # Moderate importance
+        "registrant_organization": 10, # Moderate importance
+        "registrar": 5,        # Lower importance, but still good to know
+        "dnssec": 15           # High importance if DNSSEC status changes
+    }
     
     def __init__(self):
         self.change_history = []
     
-    def detect_changes(self, old_records: Optional[Dict], new_records: Dict) -> Tuple[List[Dict], int]:
+    def detect_changes(self, old_info: Optional[Dict], new_info: Dict) -> Tuple[List[Dict], int]: # Updated method signature
         """
-        Detect changes between old and new DNS records.
+        Detect changes between old and new WHOIS info.
         Returns: (list of changes, importance_score)
         """
-        if old_records is None:
-            # First run - all records are "new"
+        if old_info is None:
+            # First run - all records are "new" (initial sync)
             changes = [
                 {
-                    "type": "initial_sync",
-                    "records_count": len(new_records.get("records", [])),
+                    "action": "initial_sync",
+                    "domain_name": new_info.get("domain_name"),
                     "timestamp": datetime.now().isoformat()
                 }
             ]
             return changes, 0  # Don't alert on first run
-        
-        old_recs = {r["name"]: r for r in old_records.get("records", [])}
-        new_recs = {r["name"]: r for r in new_records.get("records", [])}
-        
+
         changes = []
         importance_score = 0
         
-        # Detect added records
-        for name, new_rec in new_recs.items():
-            if name not in old_recs:
+        for field, score_value in self.CRITICAL_WHOIS_FIELDS.items():
+            old_val = old_info.get(field)
+            new_val = new_info.get(field)
+
+            if old_val != new_val:
                 change = {
-                    "action": "added",
-                    "name": name,
-                    "type": new_rec.get("type"),
-                    "content": new_rec.get("content"),
-                    "ttl": new_rec.get("ttl"),
+                    "action": "modified",
+                    "field": field,
+                    "old_value": old_val,
+                    "new_value": new_val,
                     "timestamp": datetime.now().isoformat()
                 }
                 changes.append(change)
-                importance_score += self._score_record_type(new_rec.get("type"))
-        
-        # Detect removed records
-        for name, old_rec in old_recs.items():
-            if name not in new_recs:
-                change = {
-                    "action": "removed",
-                    "name": name,
-                    "type": old_rec.get("type"),
-                    "content": old_rec.get("content"),
-                    "ttl": old_rec.get("ttl"),
-                    "timestamp": datetime.now().isoformat()
-                }
-                changes.append(change)
-                importance_score += self._score_record_type(old_rec.get("type")) + 5  # Removal is worse
-        
-        # Detect modified records
-        for name, new_rec in new_recs.items():
-            if name in old_recs:
-                old_rec = old_recs[name]
-                if old_rec.get("content") != new_rec.get("content"):
-                    change = {
-                        "action": "modified",
-                        "name": name,
-                        "type": new_rec.get("type"),
-                        "old_content": old_rec.get("content"),
-                        "new_content": new_rec.get("content"),
-                        "old_ttl": old_rec.get("ttl"),
-                        "new_ttl": new_rec.get("ttl"),
-                        "timestamp": datetime.now().isoformat()
-                    }
-                    changes.append(change)
-                    importance_score += self._score_record_type(new_rec.get("type")) + 3  # Modification is significant
+                importance_score += score_value
         
         return changes, importance_score
     
-    @staticmethod
-    def _score_record_type(record_type: str) -> int:
-        """Score the importance of a record type change"""
-        if record_type in ChangeDetector.CRITICAL_TYPES:
-            return 10
-        elif record_type in ChangeDetector.HIGH_TYPES:
-            return 7
-        elif record_type in ChangeDetector.MEDIUM_TYPES:
-            return 4
-        elif record_type in ChangeDetector.LOW_TYPES:
-            return 2
-        return 1
-
+    # Removed _score_record_type as it's no longer relevant
 
 
 class DNSWatchdogAgent:
@@ -212,29 +189,33 @@ class DNSWatchdogAgent:
     
     def __init__(self):
         # Load environment variables
-        self.api_token = os.getenv("ZONER_API_TOKEN")
+        # ZONER_API_TOKEN is no longer needed
         self.push_service_type = os.getenv("PUSH_SERVICE_TYPE", "webhook") # Default to generic webhook
         self.push_service_url = os.getenv("PUSH_SERVICE_URL")
         self.push_token = os.getenv("PUSH_TOKEN")
+        # Optional keys for specific adapters
+        self.pushover_user_key = os.getenv("PUSHOVER_USER_KEY")
+        self.fcm_device_token = os.getenv("FCM_DEVICE_TOKEN")
+
+
         self.domains_to_monitor = os.getenv("DOMAINS_TO_MONITOR", "").split(",")
         
-        # Validate environment variables
-        if not self.api_token:
-            raise ValueError("ZONER_API_TOKEN environment variable not set")
-        if not self.push_service_url:
-            raise ValueError("PUSH_SERVICE_URL environment variable not set for push notifications")
+        # Validate environment variables (simplified for WHOIS)
+        # ZONER_API_TOKEN is not validated here as it's not used
+        if not self.push_service_url and self.push_service_type.lower() not in ["pushover", "firebase", "pushbullet"] : # Push service URL is crucial for webhooks
+            raise ValueError("PUSH_SERVICE_URL environment variable not set for webhook-based push notifications")
         
         self.domains_to_monitor = [d.strip() for d in self.domains_to_monitor if d.strip()]
         if not self.domains_to_monitor:
             raise ValueError("DOMAINS_TO_MONITOR environment variable not set or empty")
         
         # Initialize components
-        self.api_client = ZonerAPIClient(self.api_token)
+        self.whois_client = WhoisClient() # <--- NEW: WHOIS client
         self.state_manager = DNSStateManager()
         self.change_detector = ChangeDetector()
         
-        # Initialize notification sender using the factory
-        adapter_kwargs = {}
+        # Initialize notification sender using the factory (improved logic from previous fix)
+        adapter_kwargs: Dict[str, Any] = {}
         push_service_type_lower = self.push_service_type.lower()
 
         if push_service_type_lower in ["discord", "slack", "webhook"]:
@@ -249,15 +230,15 @@ class DNSWatchdogAgent:
             if not self.push_token:
                 raise ValueError("PUSH_TOKEN (server_key) environment variable not set for Firebase")
             adapter_kwargs["server_key"] = self.push_token
-            if os.getenv("FCM_DEVICE_TOKEN"): # Optional device token for Firebase
-                adapter_kwargs["device_token"] = os.getenv("FCM_DEVICE_TOKEN")
+            if self.fcm_device_token:
+                adapter_kwargs["device_token"] = self.fcm_device_token
         elif push_service_type_lower == "pushover":
             if not self.push_token:
                 raise ValueError("PUSH_TOKEN (api_token) environment variable not set for Pushover")
-            if not os.getenv("PUSHOVER_USER_KEY"):
+            if not self.pushover_user_key:
                 raise ValueError("PUSHOVER_USER_KEY environment variable not set for Pushover")
             adapter_kwargs["api_token"] = self.push_token
-            adapter_kwargs["user_key"] = os.getenv("PUSHOVER_USER_KEY")
+            adapter_kwargs["user_key"] = self.pushover_user_key
         elif push_service_type_lower == "pushbullet":
             if not self.push_token:
                 raise ValueError("PUSH_TOKEN (access_token) environment variable not set for Pushbullet")
@@ -271,7 +252,7 @@ class DNSWatchdogAgent:
     
     def run_check(self, domain: str) -> bool:
         """
-        Run a single DNS check for a domain.
+        Run a single WHOIS check for a domain.
         
         Args:
             domain: Domain to check
@@ -279,43 +260,45 @@ class DNSWatchdogAgent:
         Returns:
             True if check completed successfully, False otherwise
         """
-        logger.info(f"Starting DNS check for {domain}")
+        logger.info(f"Starting WHOIS check for {domain}")
         
-        # Fetch current DNS records
-        current_records = self.api_client.get_dns_records(domain)
-        if current_records is None:
-            logger.error(f"Failed to fetch DNS records for {domain}")
+        # Fetch current WHOIS info
+        current_whois_info = self.whois_client.get_domain_info(domain) # <--- UPDATED
+        if current_whois_info is None:
+            logger.error(f"Failed to fetch WHOIS info for {domain}")
             return False
         
         # Get previous state
         previous_state = self.state_manager.get_domain_state(domain)
-        previous_records = previous_state.get("records") if previous_state else None
+        previous_whois_info = previous_state.get("whois_info") if previous_state else None # <--- UPDATED
         
         # Detect changes
-        changes, importance_score = self.change_detector.detect_changes(previous_records, current_records)
+        changes, importance_score = self.change_detector.detect_changes(previous_whois_info, current_whois_info) # <--- UPDATED
         
         # Save new state
-        self.state_manager.set_domain_state(domain, current_records)
+        self.state_manager.set_domain_state(domain, current_whois_info) # <--- UPDATED
         self.state_manager.save_state()
         
         # Trigger notifications based on importance
         if changes:
-            if previous_records is None:
+            if previous_whois_info is None:
                 logger.info(f"Initial sync for {domain} - no notification sent")
+                # For karlik.cz, if it's currently available, this is where we'd notify
+                # However, initial sync is not an alert
             elif importance_score >= 20:
-                title = f"🚨 CRITICAL: DNS changes detected on {domain}"
-                message = f"{len(changes)} DNS record(s) changed - requires immediate attention"
+                title = f"🚨 CRITICAL: WHOIS changes detected on {domain}"
+                message = f"{len(changes)} critical WHOIS field(s) changed - requires immediate attention"
                 logger.warning(f"Critical changes detected for {domain} (score: {importance_score})")
                 self.notification_sender.send(title, message, changes, importance_score, domain)
             elif importance_score >= 10:
-                title = f"⚠️ WARNING: DNS changes detected on {domain}"
-                message = f"{len(changes)} DNS record(s) changed - review required"
-                logger.warning(f"Warning: DNS changes for {domain} (score: {importance_score})")
+                title = f"⚠️ WARNING: WHOIS changes detected on {domain}"
+                message = f"{len(changes)} important WHOIS field(s) changed - review required"
+                logger.warning(f"Warning: WHOIS changes for {domain} (score: {importance_score})")
                 self.notification_sender.send(title, message, changes, importance_score, domain)
             elif importance_score > 0:
-                title = f"ℹ️ INFO: DNS changes on {domain}"
-                message = f"{len(changes)} DNS record(s) changed"
-                logger.info(f"Info: Minor DNS changes for {domain} (score: {importance_score})")
+                title = f"ℹ️ INFO: WHOIS changes on {domain}"
+                message = f"{len(changes)} WHOIS field(s) changed"
+                logger.info(f"Info: Minor WHOIS changes for {domain} (score: {importance_score})")
                 self.notification_sender.send(title, message, changes, importance_score, domain)
         else:
             logger.info(f"No changes detected for {domain}")
@@ -324,13 +307,13 @@ class DNSWatchdogAgent:
     
     def run_full_check(self) -> Dict[str, bool]:
         """
-        Run DNS checks for all monitored domains.
+        Run WHOIS checks for all monitored domains.
         
         Returns:
             Dict mapping domain to check result
         """
         logger.info("=" * 60)
-        logger.info("Running full DNS watchdog check")
+        logger.info("Running full WHOIS watchdog check")
         logger.info("=" * 60)
         
         results = {}
