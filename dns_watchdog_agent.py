@@ -47,7 +47,7 @@ class WhoisClient:
             # Extract relevant fields and standardize
             info = {
                 "domain_name": whois_data.domain_name,
-                "registrar": whois_data.registrar,
+                "registrar": whois_data.registrar.lower() if whois_data.registrar else None,
                 "creation_date": whois_data.creation_date.isoformat() if whois_data.creation_date else None,
                 "expiration_date": whois_data.expiration_date.isoformat() if whois_data.expiration_date else None,
                 "last_updated": whois_data.last_updated.isoformat() if whois_data.last_updated else None,
