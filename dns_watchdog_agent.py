@@ -385,6 +385,10 @@ class DNSWatchdogAgent:
             except Exception as e:
                 logger.error(f"Exception checking {domain}: {e}", exc_info=True)
                 results[domain] = False
+            
+            # Add a delay between WHOIS queries to avoid rate limiting
+            import time
+            time.sleep(2) # Wait for 2 seconds between each domain check
         
         logger.info("=" * 60)
         logger.info("Full check completed")
