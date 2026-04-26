@@ -176,7 +176,7 @@ class ChangeDetector:
         for name, new_rec in new_recs.items():
             if name in old_recs:
                 old_rec = old_recs[name]
-                if old_rec.get("content") != new_rec.get("content")}:
+                if old_rec.get("content") != new_rec.get("content"):
                     change = {
                         "action": "modified",
                         "name": name,
