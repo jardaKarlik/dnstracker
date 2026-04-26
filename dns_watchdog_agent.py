@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import requests
 from pathlib import Path
+from push_adapters import create_adapter # <--- ADDED THIS LINE
 
 # Configure logging
 logging.basicConfig(
@@ -175,7 +176,7 @@ class ChangeDetector:
         for name, new_rec in new_recs.items():
             if name in old_recs:
                 old_rec = old_recs[name]
-                if old_rec.get("content") != new_rec.get("content"):
+                if old_rec.get("content") != new_rec.get("content")}:
                     change = {
                         "action": "modified",
                         "name": name,
@@ -205,97 +206,6 @@ class ChangeDetector:
         return 1
 
 
-class PushNotificationSender:
-    """Sends push notifications for DNS changes"""
-    
-    def __init__(self, push_service_url: str, push_token: str):
-        """
-        Initialize push notification sender.
-        
-        Args:
-            push_service_url: URL of push notification service
-            push_token: Authentication token for push service
-        """
-        self.push_service_url = push_service_url
-        self.push_token = push_token
-    
-    def send_notification(self, title: str, message: str, changes: List[Dict], 
-                         importance_score: int, domain: str) -> bool:
-        """
-        Send push notification about DNS changes.
-        
-        Args:
-            title: Notification title
-            message: Notification message
-            changes: List of detected changes
-            importance_score: Importance score of changes
-            domain: Domain being monitored
-        
-        Returns:
-            True if sent successfully, False otherwise
-        """
-        payload = {
-            "title": title,
-            "message": message,
-            "domain": domain,
-            "importance_score": importance_score,
-            "changes": changes,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.push_token}",
-                "Content-Type": "application/json"
-            }
-            response = requests.post(
-                self.push_service_url,
-                json=payload,
-                headers=headers,
-                timeout=10
-            )
-            response.raise_for_status()
-            logger.info(f"Push notification sent for {domain}")
-            return True
-        except requests.RequestException as e:
-            logger.error(f"Failed to send push notification: {e}")
-            return False
-    
-    def send_critical_alert(self, domain: str, changes: List[Dict]):
-        """Send critical alert for important changes"""
-        change_summary = self._format_changes(changes)
-        title = f"🚨 CRITICAL: DNS changes detected on {domain}"
-        message = f"{len(changes)} DNS record(s) changed - requires immediate attention"
-        self.send_notification(title, message, changes, 100, domain)
-    
-    def send_warning_alert(self, domain: str, changes: List[Dict], importance_score: int):
-        """Send warning alert for moderate changes"""
-        change_summary = self._format_changes(changes)
-        title = f"⚠️ WARNING: DNS changes detected on {domain}"
-        message = f"{len(changes)} DNS record(s) changed - review required"
-        self.send_notification(title, message, changes, importance_score, domain)
-    
-    def send_info_alert(self, domain: str, changes: List[Dict]):
-        """Send info alert for minor changes"""
-        change_summary = self._format_changes(changes)
-        title = f"ℹ️ INFO: DNS changes on {domain}"
-        message = f"{len(changes)} DNS record(s) changed"
-        self.send_notification(title, message, changes, 1, domain)
-    
-    @staticmethod
-    def _format_changes(changes: List[Dict]) -> str:
-        """Format changes for human-readable display"""
-        lines = []
-        for change in changes:
-            if change.get("type") == "initial_sync":
-                lines.append(f"Initial sync: {change['records_count']} records")
-            else:
-                action = change.get("action", "unknown")
-                name = change.get("name", "unknown")
-                record_type = change.get("type", "unknown")
-                lines.append(f"{action.upper()}: {name} ({record_type})")
-        return "\n".join(lines)
-
 
 class DNSWatchdogAgent:
     """Main watchdog agent orchestrator"""
@@ -303,6 +213,7 @@ class DNSWatchdogAgent:
     def __init__(self):
         # Load environment variables
         self.api_token = os.getenv("ZONER_API_TOKEN")
+        self.push_service_type = os.getenv("PUSH_SERVICE_TYPE", "webhook") # Default to generic webhook
         self.push_service_url = os.getenv("PUSH_SERVICE_URL")
         self.push_token = os.getenv("PUSH_TOKEN")
         self.domains_to_monitor = os.getenv("DOMAINS_TO_MONITOR", "").split(",")
@@ -310,8 +221,8 @@ class DNSWatchdogAgent:
         # Validate environment variables
         if not self.api_token:
             raise ValueError("ZONER_API_TOKEN environment variable not set")
-        if not self.push_service_url or not self.push_token:
-            raise ValueError("PUSH_SERVICE_URL and PUSH_TOKEN environment variables not set")
+        if not self.push_service_url:
+            raise ValueError("PUSH_SERVICE_URL environment variable not set for push notifications")
         
         self.domains_to_monitor = [d.strip() for d in self.domains_to_monitor if d.strip()]
         if not self.domains_to_monitor:
@@ -321,7 +232,23 @@ class DNSWatchdogAgent:
         self.api_client = ZonerAPIClient(self.api_token)
         self.state_manager = DNSStateManager()
         self.change_detector = ChangeDetector()
-        self.notification_sender = PushNotificationSender(self.push_service_url, self.push_token)
+        
+        # Initialize notification sender using the factory
+        adapter_kwargs = {"webhook_url": self.push_service_url}
+        if self.push_token:
+            adapter_kwargs["auth_token"] = self.push_token
+        
+        # Special handling for Firebase/Pushover/Pushbullet that use PUSH_TOKEN as API key/user key
+        if self.push_service_type.lower() == "firebase":
+            adapter_kwargs = {"server_key": self.push_token}
+            if os.getenv("FCM_DEVICE_TOKEN"): # Optional device token for Firebase
+                adapter_kwargs["device_token"] = os.getenv("FCM_DEVICE_TOKEN")
+        elif self.push_service_type.lower() == "pushover":
+            adapter_kwargs = {"api_token": self.push_token, "user_key": os.getenv("PUSHOVER_USER_KEY")}
+        elif self.push_service_type.lower() == "pushbullet":
+            adapter_kwargs = {"access_token": self.push_token}
+        
+        self.notification_sender = create_adapter(self.push_service_type, **adapter_kwargs)
         
         logger.info(f"DNS Watchdog Agent initialized for domains: {', '.join(self.domains_to_monitor)}")
     
@@ -359,14 +286,20 @@ class DNSWatchdogAgent:
             if previous_records is None:
                 logger.info(f"Initial sync for {domain} - no notification sent")
             elif importance_score >= 20:
+                title = f"🚨 CRITICAL: DNS changes detected on {domain}"
+                message = f"{len(changes)} DNS record(s) changed - requires immediate attention"
                 logger.warning(f"Critical changes detected for {domain} (score: {importance_score})")
-                self.notification_sender.send_critical_alert(domain, changes)
+                self.notification_sender.send(title, message, changes, importance_score, domain)
             elif importance_score >= 10:
+                title = f"⚠️ WARNING: DNS changes detected on {domain}"
+                message = f"{len(changes)} DNS record(s) changed - review required"
                 logger.warning(f"Warning: DNS changes for {domain} (score: {importance_score})")
-                self.notification_sender.send_warning_alert(domain, changes, importance_score)
+                self.notification_sender.send(title, message, changes, importance_score, domain)
             elif importance_score > 0:
+                title = f"ℹ️ INFO: DNS changes on {domain}"
+                message = f"{len(changes)} DNS record(s) changed"
                 logger.info(f"Info: Minor DNS changes for {domain} (score: {importance_score})")
-                self.notification_sender.send_info_alert(domain, changes)
+                self.notification_sender.send(title, message, changes, importance_score, domain)
         else:
             logger.info(f"No changes detected for {domain}")
         
